@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+"""git-stack: manage a stack of PR branches.
+
+Usage:
+  git stack list                Show the stack (bottom -> top)
+  git stack status              Show stack + which branches need restacking
+  git stack rebase [base]       Rebase whole stack onto base (default origin/main)
+  git stack restack             After amending current branch, restack branches above
+  git stack push [-f]           Push all branches + update PR bases on GitHub
+  git stack annotate            Update each PR's body with a stack diagram
+
+Model: each PR is its own named branch, with bases set to the previous branch.
+GitHub's normal Merge button keeps working. Auto-detects the stack from
+branch ancestry relative to the base branch (default: origin/main).
+
+Requires: git, gh (only for `push` and `annotate`).
+"""
+
+import subprocess
+import sys
+
+DEFAULT_BASE = "origin/main"
+
+# ANSI colors (auto-disabled when not a tty)
+USE_COLOR = sys.stdout.isatty()
+
+
+def c(code, text):
+    if not USE_COLOR:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def dim(text):
+    return c("2", text)
+
+
+def bold(text):
+    return c("1", text)
+
+
+def green(text):
+    return c("32", text)
+
+
+def red(text):
+    return c("31", text)
+
+
+def yellow(text):
+    return c("33", text)
+
+
+def cyan(text):
+    return c("36", text)
+
+
+def magenta(text):
+    return c("35", text)
+
+
+def run(cmd, check=True, capture=False):
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if check and result.returncode != 0:
+        if capture:
+            sys.stderr.write(result.stderr)
+        raise SystemExit(f"command failed ({result.returncode}): {cmd}")
+    return result.stdout.strip() if capture else ""
+
+
+def current_branch():
+    return run("git rev-parse --abbrev-ref HEAD", capture=True)
+
+
+def commit_subject(sha):
+    return run(f"git log -1 --format=%s {sha}", capture=True)
+
+
+def rev_list_count(base, head):
+    return int(run(f"git rev-list --count {base}..{head}", capture=True) or "0")
+
+
+def is_ancestor(a, b):
+    return subprocess.run(
+        f"git merge-base --is-ancestor {a} {b}", shell=True
+    ).returncode == 0
+
+
+def all_local_branches():
+    out = run("git for-each-ref --format='%(refname:short)' refs/heads/", capture=True)
+    return [line for line in out.splitlines() if line]
+
+
+def detect_stack(base=DEFAULT_BASE):
+    """Return ordered branch list (bottom -> top) for the stack containing the
+    current branch. Detects the chain purely from branch-to-branch ancestry
+    (so it works even if the base branch has moved ahead). Excludes trunk
+    branches (main/master) and the configured base."""
+    cur = current_branch()
+    if cur == "HEAD":
+        raise SystemExit("detached HEAD — checkout a branch first")
+
+    trunk = {base, base.replace("origin/", ""), "main", "master"}
+    all_branches = [b for b in all_local_branches() if b not in trunk and b != cur]
+
+    chain = [cur]
+
+    # Walk down: find local branches that are ancestors of chain[0]
+    while True:
+        head_name = chain[0]
+        lower = [b for b in all_branches if b not in chain and is_ancestor(b, head_name)]
+        if not lower:
+            break
+        # Closest = fewest commits between ancestor and head (immediate parent)
+        lower.sort(key=lambda b: rev_list_count(b, head_name))
+        chain.insert(0, lower[0])
+
+    # Walk up: find local branches that have chain[-1] as ancestor
+    while True:
+        tail_name = chain[-1]
+        higher = [b for b in all_branches if b not in chain and is_ancestor(tail_name, b)]
+        if not higher:
+            break
+        # Closest = fewest commits above tail
+        higher.sort(key=lambda b: rev_list_count(tail_name, b))
+        chain.append(higher[0])
+
+    return chain
+
+
+def remap_branches(stack, base, top, old_subjects, skip_bottom=0):
+    """After rebasing `top` onto `base`, update each branch in stack[skip_bottom:-1]
+    to the new commit with matching subject."""
+    new_commits = run(f"git rev-list --reverse {base}..{top}", capture=True).splitlines()
+    new_subjects = {}
+    for c in new_commits:
+        new_subjects[commit_subject(c)] = c
+
+    for b in stack[skip_bottom:-1]:
+        subj = old_subjects.get(b)
+        new_sha = new_subjects.get(subj) if subj else None
+        if new_sha:
+            run(f"git branch -f {b} {new_sha}")
+            print(f"  updated {b} -> {new_sha[:8]} ({subj})")
+        else:
+            print(f"  WARNING: could not remap {b} (subject: {subj!r})")
+
+
+def get_pr_num(branch):
+    return run(f"gh pr list --head {branch} --json number --jq .[0].number",
+               capture=True, check=False)
+
+
+def render_stack(stack, base=DEFAULT_BASE, show_status=False):
+    """Pretty-print the stack as a tree. Highlights the current branch."""
+    cur = current_branch()
+    n = len(stack)
+
+    print(f"\n{bold('Stack')} {dim('(' + base + ')')}\n")
+    print(f"  {dim(base)}")
+    print(f"  {dim('│')}")
+
+    all_clean = True
+    for i, b in enumerate(stack):
+        parent = stack[i-1] if i > 0 else base
+        is_last = i == n - 1
+        is_cur = b == cur
+
+        # Tree shape by position; arrow marks current branch without changing shape
+        base_conn = "└── " if is_last else "├── "
+        connector = base_conn[:-2] + "⮞ " if is_cur else base_conn
+
+        # Branch name (current branch highlighted in cyan)
+        if is_cur:
+            name_str = bold(cyan(b))
+        else:
+            name_str = bold(b)
+
+        # Parent relationship
+        parent_str = dim(f"← {parent}")
+
+        # PR number
+        pr_num = get_pr_num(b)
+        pr_str = dim(f"#{pr_num}") if pr_num else dim("no PR")
+
+        # Status
+        status_str = ""
+        if show_status:
+            parent_sha = run(f"git rev-parse {parent}", capture=True)
+            mb = run(f"git merge-base {b} {parent}", capture=True)
+            if mb == parent_sha:
+                status_str = green("ok")
+            else:
+                status_str = red("needs restack")
+                all_clean = False
+
+        # PR title (only on list, not status — keeps status cleaner)
+        if not show_status:
+            pr_title = run(f"gh pr view {pr_num} --json title --jq .title",
+                           capture=True, check=False) if pr_num else ""
+            subj_str = dim(pr_title) if pr_title else ""
+        else:
+            subj_str = ""
+
+        # Build the line with proper spacing
+        sep = dim("·")
+        line_parts = [name_str, parent_str, sep, pr_str]
+        if show_status:
+            line_parts.extend([sep, status_str])
+        if subj_str:
+            line_parts.extend([sep, subj_str])
+
+        print(f"  {connector}{' '.join(line_parts)}".rstrip())
+
+    print()
+    if show_status:
+        if all_clean:
+            print(f"{green('✓')} all branches restacked cleanly.")
+        else:
+            print(f"{yellow('⚠')} some branches need restacking — run: {bold('git stack restack')}")
+        print()
+
+
+def cmd_list(base=DEFAULT_BASE):
+    stack = detect_stack(base)
+    render_stack(stack, base, show_status=False)
+
+
+def cmd_rebase(base=DEFAULT_BASE):
+    stack = detect_stack(base)
+    if len(stack) == 1:
+        print(f"only one branch in stack; just `git rebase {base}`")
+        return
+
+    bottom = stack[0]
+    top = stack[-1]
+    old_subjects = {b: commit_subject(b) for b in stack}
+
+    old_base_sha = run(f"git rev-parse {bottom}~1", capture=True)
+
+    print(f"\n{bold('Rebasing')} {len(stack)} branches onto {cyan(base)}...\n")
+    run(f"git rebase --onto {base} {old_base_sha} {top}")
+
+    remap_branches(stack, base, top, old_subjects)
+
+    run(f"git checkout {top}")
+    print(f"\n{green('✓')} done. now on {bold(top)}.")
+    print(f"  review with: {dim('git stack status')}")
+    print(f"  push with:   {dim('git stack push')}")
+
+
+def cmd_restack():
+    stack = detect_stack()
+    cur = current_branch()
+    idx = stack.index(cur)
+
+    if idx == len(stack) - 1:
+        print(f"{cur} is already the top of the stack — nothing to restack.")
+        return
+
+    new_sha = run(f"git rev-parse {cur}", capture=True)
+    old_sha = None
+    for i in range(1, 15):
+        candidate = run(f"git rev-parse {cur}@{{{i}}}", capture=True, check=False)
+        if candidate and candidate != new_sha:
+            old_sha = candidate
+            break
+    if not old_sha:
+        raise SystemExit(
+            f"could not find a previous position for {cur} in reflog. "
+            "did you amend it?"
+        )
+
+    top = stack[-1]
+    old_subjects = {b: commit_subject(b) for b in stack[idx+1:]}
+
+    count = len(stack) - idx - 1
+    print(f"\n{bold('Restacking')} {count} branch{'es' if count != 1 else ''} above {cyan(cur)}...")
+    print(f"  {dim('old')} {old_sha[:8]}  {dim('→')}  {dim('new')} {new_sha[:8]}\n")
+    run(f"git rebase --onto {cur} {old_sha} {top}")
+
+    new_commits = run(f"git rev-list --reverse {cur}..{top}", capture=True).splitlines()
+    new_subjects = {commit_subject(c): c for c in new_commits}
+    for b in stack[idx+1:-1]:
+        subj = old_subjects.get(b)
+        new = new_subjects.get(subj) if subj else None
+        if new:
+            run(f"git branch -f {b} {new}")
+            print(f"  {green('✓')} {bold(b)} {dim('→')} {new[:8]} {dim(subj)}")
+        else:
+            print(f"  {red('✗')} {bold(b)} {dim('— could not remap')} {dim(repr(subj))}")
+
+    run(f"git checkout {top}")
+    print(f"\n{green('✓')} done. now on {bold(top)}.")
+    print(f"  push with: {dim('git stack push')}")
+
+
+def cmd_push(force=False):
+    stack = detect_stack()
+    flag = "--force" if force else "--force-with-lease"
+    print(f"\n{bold('Pushing')} {len(stack)} branches {dim('(' + flag + ')')}...\n")
+    for b in stack:
+        run(f"git push {flag} origin {b}")
+        print(f"  {green('✓')} {bold(b)}")
+
+    print(f"\n{bold('Updating PR bases')}...\n")
+    for i, b in enumerate(stack):
+        pr_base = stack[i-1] if i > 0 else "main"
+        pr_num = get_pr_num(b)
+        if pr_num:
+            run(f"gh pr edit {pr_num} --base {pr_base}", check=False)
+            print(f"  {green('✓')} {dim('#' + pr_num)} {bold(b)} {dim('→')} {dim('base ' + pr_base)}")
+        else:
+            print(f"  {yellow('·')} {bold(b)} {dim('— no open PR')}")
+    print(f"\n{green('✓')} done.")
+
+
+def cmd_status(base=DEFAULT_BASE):
+    stack = detect_stack(base)
+    render_stack(stack, base, show_status=True)
+
+
+STACK_BLOCK_START = "<!-- git-stack:start -->"
+STACK_BLOCK_END = "<!-- git-stack:end -->"
+
+
+def build_stack_markdown(stack, base, repo_url, current_pr_num=None):
+    """Build the markdown for the stack diagram block.
+
+    Uses HTML comment markers (invisible to readers) so the block is
+    idempotently replaceable. Plain text with tree connectors; the PR
+    matching `current_pr_num` gets `└─⮞`, others get `├──`. Followed by a
+    horizontal rule separating it from the rest of the description."""
+    n = len(stack)
+    lines = [STACK_BLOCK_START, ""]
+    lines.append("**Stack**")
+
+    for i, b in enumerate(stack):
+        pr_num = get_pr_num(b)
+        is_current = pr_num == current_pr_num
+        is_last = i == n - 1
+        # Tree shape by position; arrow marks current PR without changing shape
+        base = "└──" if is_last else "├──"
+        connector = base[:-1] + "⮞" if is_current else base
+        title = run(f"gh pr view {pr_num} --json title --jq .title",
+                    capture=True, check=False) if pr_num else b
+        title_str = f"`{title}`" if title else ""
+        if pr_num:
+            url = f"{repo_url}/pull/{pr_num}"
+            lines.append(f"{connector} [#{pr_num}]({url})  {title_str}".rstrip())
+        else:
+            lines.append(f"{connector} {b}  {title_str}".rstrip())
+
+    lines.append("")
+    lines.append("---")
+    lines.append(STACK_BLOCK_END)
+    return "\n".join(lines)
+
+
+def cmd_annotate():
+    import tempfile
+    import json
+
+    stack = detect_stack()
+    repo_url = run("gh repo view --json url --jq .url", capture=True, check=False)
+    if not repo_url:
+        raise SystemExit("could not determine repo url via `gh repo view`")
+
+    # Extract owner/repo from URL (strip trailing slash)
+    repo_path = repo_url.replace("https://github.com/", "").rstrip("/")
+
+    for b in stack:
+        pr_num = get_pr_num(b)
+        if not pr_num:
+            print(f"  {yellow('·')} {bold(b)} {dim('— no open PR')}")
+            continue
+
+        # Build the stack block with this PR marked as current
+        markdown = build_stack_markdown(stack, DEFAULT_BASE, repo_url, current_pr_num=pr_num)
+
+        body = run(f"gh pr view {pr_num} --json body --jq .body", capture=True, check=False)
+
+        if STACK_BLOCK_START in body:
+            # Replace existing block
+            before = body[:body.index(STACK_BLOCK_START)]
+            after = body[body.index(STACK_BLOCK_END) + len(STACK_BLOCK_END):]
+            new_body = before + markdown + after
+        else:
+            # Prepend block at the top
+            new_body = markdown + "\n\n" + body.lstrip("\n")
+
+        # Use REST API (gh pr edit is broken due to GraphQL deprecation)
+        payload = json.dumps({"body": new_body})
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write(payload)
+            f.flush()
+            run(f"gh api -X PATCH /repos/{repo_path}/pulls/{pr_num} --input {f.name}",
+                check=False)
+
+        print(f"  {green('✓')} {dim('#' + pr_num)} {bold(b)}")
+
+    print(f"\n{green('✓')} updated {len(stack)} PR descriptions.")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    if cmd == "list":
+        cmd_list(args[0] if args else DEFAULT_BASE)
+    elif cmd == "rebase":
+        cmd_rebase(args[0] if args else DEFAULT_BASE)
+    elif cmd == "restack":
+        cmd_restack()
+    elif cmd == "push":
+        cmd_push(force=("-f" in args or "--force" in args))
+    elif cmd == "status":
+        cmd_status(args[0] if args else DEFAULT_BASE)
+    elif cmd == "annotate":
+        cmd_annotate()
+    elif cmd in ("-h", "--help", "help"):
+        print(__doc__)
+    else:
+        print(f"unknown command: {cmd}")
+        print(__doc__)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
