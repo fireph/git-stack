@@ -161,6 +161,7 @@ def render_stack(stack, base=DEFAULT_BASE, show_status=False):
     print(f"  {dim('│')}")
 
     all_clean = True
+    needs_rebase = False
     for i, b in enumerate(stack):
         parent = stack[i-1] if i > 0 else base
         is_last = i == n - 1
@@ -191,8 +192,12 @@ def render_stack(stack, base=DEFAULT_BASE, show_status=False):
             if mb == parent_sha:
                 status_str = green("ok")
             else:
-                status_str = red("needs restack")
                 all_clean = False
+                if i == 0:
+                    status_str = red("needs rebase")
+                    needs_rebase = True
+                else:
+                    status_str = red("needs restack")
 
         # PR title (only on list, not status — keeps status cleaner)
         if not show_status:
@@ -216,6 +221,8 @@ def render_stack(stack, base=DEFAULT_BASE, show_status=False):
     if show_status:
         if all_clean:
             print(f"{green('✓')} all branches restacked cleanly.")
+        elif needs_rebase:
+            print(f"{yellow('⚠')} stack is behind {base} — run: {bold('git stack rebase')}")
         else:
             print(f"{yellow('⚠')} some branches need restacking — run: {bold('git stack restack')}")
         print()
