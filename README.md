@@ -7,7 +7,7 @@ main
   │
   ├── feature/part-1   ← base: main
   ├── feature/part-2   ← base: feature/part-1
-  └─⮞ feature/part-3   ← base: feature/part-2   (you are here)
+  └─→ feature/part-3   ← base: feature/part-2   (you are here)
 ```
 
 ## Install
@@ -40,14 +40,14 @@ Requires `git` and `gh` (GitHub CLI). Ensure `~/.local/bin` is on your `PATH`.
 
 **Pushing** force-pushes (`--force-with-lease` by default, `--force` with `-f`) all branches in the stack and sets each PR's base to the previous branch via the GitHub API.
 
-**Annotating** inserts a stack diagram into each PR's description, wrapped in invisible HTML comment markers so it's idempotent — run it as many times as you want, it replaces just the stack block, leaving the rest of your description untouched. Each PR marks itself with `⮞`:
+**Annotating** inserts a stack diagram into each PR's description, wrapped in invisible HTML comment markers so it's idempotent — run it as many times as you want, it replaces just the stack block, leaving the rest of your description untouched. Each PR marks itself with `→`:
 
 ```markdown
 <!-- git-stack:start -->
 
 **Stack**
 ├── [#101](https://github.com/owner/repo/pull/101)  `Part 1: database schema`
-├─⮞ [#102](https://github.com/owner/repo/pull/102)  `Part 2: API endpoints`
+├─→ [#102](https://github.com/owner/repo/pull/102)  `Part 2: API endpoints`
 └── [#103](https://github.com/owner/repo/pull/103)  `Part 3: frontend`
 
 ---

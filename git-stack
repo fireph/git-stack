@@ -219,7 +219,7 @@ def render_stack(stack, base=DEFAULT_BASE, show_status=False):
 
         # Tree shape by position; arrow marks current branch without changing shape
         base_conn = "└── " if is_last else "├── "
-        connector = base_conn[:-2] + "⮞ " if is_cur else base_conn
+        connector = base_conn[:-2] + "→ " if is_cur else base_conn
 
         # Branch name (current branch highlighted in cyan)
         if is_cur:
@@ -391,7 +391,7 @@ def build_stack_markdown(stack, base, repo_url, current_pr_num=None):
 
     Uses HTML comment markers (invisible to readers) so the block is
     idempotently replaceable. Plain text with tree connectors; the PR
-    matching `current_pr_num` gets `└─⮞`, others get `├──`. Followed by a
+    matching `current_pr_num` gets `└─→`, others get `├──`. Followed by a
     horizontal rule separating it from the rest of the description."""
     n = len(stack)
     lines = [STACK_BLOCK_START, ""]
@@ -403,7 +403,7 @@ def build_stack_markdown(stack, base, repo_url, current_pr_num=None):
         is_last = i == n - 1
         # Tree shape by position; arrow marks current PR without changing shape
         base = "└──" if is_last else "├──"
-        connector = base[:-1] + "⮞" if is_current else base
+        connector = base[:-1] + "→" if is_current else base
         title = run(f"gh pr view {pr_num} --json title --jq .title",
                     capture=True, check=False) if pr_num else b
         title_str = f"`{title}`" if title else ""
