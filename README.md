@@ -113,7 +113,3 @@ git stack annotate
 - **One commit per branch.** Each branch should have exactly one commit (its PR). Multi-commit branches work for rebasing but the remap-by-subject logic assumes one commit per PR.
 - **No conflict resolution assistance.** If a rebase hits conflicts, git drops you into the normal interactive rebase — resolve them, `git rebase --continue`, then re-run the original command.
 - **Linear stacks only.** No support for branching stacks (one PR with multiple children). The detection picks one path through the ancestry chain.
-
-## License
-
-MIT
