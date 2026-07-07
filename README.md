@@ -26,17 +26,17 @@ Requires `git` and `gh` (GitHub CLI). Ensure `~/.local/bin` is on your `PATH`.
 | `git stack list` | Show the stack with PR titles and current-branch arrow |
 | `git stack status` | Same as `list` + shows which branches need restacking |
 | `git stack rebase [base]` | Rebase the whole stack onto a new base (default `origin/main`) |
-| `git stack restack` | After amending a lower branch, restack everything above it |
+| `git stack restack` | Restack the whole stack (after amending any branch) |
 | `git stack push [-f]` | Push all branches + update each PR's base on GitHub |
 | `git stack annotate` | Insert/update a stack diagram in each PR's description |
 
 ## How it works
 
-**Stack detection** is automatic — no branch naming conventions, no metadata files. The script walks git ancestry (`git merge-base --is-ancestor`) to find branches that chain together relative to the base branch. Checkout any branch in the stack and it figures out the rest.
+**Stack detection** is automatic — no branch naming conventions, no metadata files. The script walks git ancestry (`git merge-base --is-ancestor`) to find branches that chain together relative to the base branch, and bridges amends via the reflog (an amended branch is no longer an ancestor of the branches above it, but its old position still is). Checkout any branch in the stack — even after amending — and it figures out the rest.
 
 **Rebasing** uses `git rebase --onto` under the hood, then remaps intermediate branches by commit subject so each PR stays on its own commit. After rebasing, intermediate branch pointers are updated to the matching commits in the new history.
 
-**Restacking** finds the old position of your amended branch via the reflog (no SHA lookup needed) and replays everything above it onto the new position.
+**Restacking** works from any branch in the stack: it finds the lowest branch that no longer sits directly on the branch below it (e.g. because that lower branch was amended) and replays everything above onto the current lower branch, then remaps the intermediate branches by commit subject. It only fixes inter-stack relationships — if the whole stack has fallen behind `main`, that's a rebase (run `git stack rebase`), which `git stack status` will tell you.
 
 **Pushing** force-pushes (`--force-with-lease` by default, `--force` with `-f`) all branches in the stack and sets each PR's base to the previous branch via the GitHub API.
 
@@ -79,12 +79,12 @@ git stack list
 git stack annotate
 ```
 
-After amending a lower PR:
+After amending a lower PR (from any branch in the stack):
 
 ```bash
 git checkout feature/part-1
 git commit --amend --no-edit
-git stack restack      # restack part-2 and part-3 on top
+git stack restack      # restack everything above the amend (run from any branch)
 git stack push         # push everything + update PR bases
 git stack annotate     # refresh the stack diagrams
 ```

@@ -5,7 +5,7 @@ Usage:
   git stack list                Show the stack (bottom -> top)
   git stack status              Show stack + which branches need restacking
   git stack rebase [base]       Rebase whole stack onto base (default origin/main)
-  git stack restack             After amending current branch, restack branches above
+  git stack restack             Restack whole stack (run after amending any branch)
   git stack push [-f]           Push all branches + update PR bases on GitHub
   git stack annotate            Update each PR's body with a stack diagram
 
@@ -91,38 +91,88 @@ def all_local_branches():
     return [line for line in out.splitlines() if line]
 
 
+def old_positions(branch, tip, limit=15):
+    """Previous SHAs of `branch` from its reflog that represent amends/rebases
+    rather than normal history. A normal commit or branch creation advances
+    the branch from an ancestor to its descendant, so the old position IS an
+    ancestor of the current tip — those are excluded. An amend (or rebase)
+    leaves the old tip as a sibling (not an ancestor) of the new tip, and that
+    is the case we need to bridge: an amended branch is no longer an ancestor
+    of the branches above it, but its old position still is."""
+    seen = []
+    for i in range(1, limit + 1):
+        sha = run(f"git rev-parse {branch}@{{{i}}}", capture=True, check=False)
+        if not sha:
+            break
+        if sha == tip or sha in seen:
+            continue
+        if is_ancestor(sha, tip):
+            continue
+        seen.append(sha)
+    return seen
+
+
 def detect_stack(base=DEFAULT_BASE):
     """Return ordered branch list (bottom -> top) for the stack containing the
-    current branch. Detects the chain purely from branch-to-branch ancestry
-    (so it works even if the base branch has moved ahead). Excludes trunk
-    branches (main/master) and the configured base."""
+    current branch. Detects the chain from branch-to-branch adjacency: each
+    branch's commit sits on the branch below's commit. Bridges amends via the
+    reflog (an amended branch is no longer an ancestor of the branches above,
+    but its old position still is), so the full stack is still found after
+    amending any branch. Excludes trunk branches (main/master) and the
+    configured base."""
     cur = current_branch()
     if cur == "HEAD":
         raise SystemExit("detached HEAD — checkout a branch first")
 
     trunk = {base, base.replace("origin/", ""), "main", "master"}
-    all_branches = [b for b in all_local_branches() if b not in trunk and b != cur]
+    branches = [b for b in all_local_branches() if b not in trunk]
+    relevant = branches if cur in branches else branches + [cur]
+    tips = {b: run(f"git rev-parse {b}", capture=True) for b in relevant}
+    parents = {b: run(f"git rev-parse {b}^", capture=True, check=False) for b in relevant}
+    olds = {b: old_positions(b, tips[b]) for b in relevant}
+    others = [b for b in branches if b != cur]
 
     chain = [cur]
 
-    # Walk down: find local branches that are ancestors of chain[0]
+    # Walk down: find the branch chain[0] sits on — i.e. the branch whose
+    # current or old (reflog) tip is chain[0]'s parent commit. Falls back to
+    # ancestry for multi-commit branches.
     while True:
-        head_name = chain[0]
-        lower = [b for b in all_branches if b not in chain and is_ancestor(b, head_name)]
+        head = chain[0]
+        head_parent = parents[head]
+        lower = []
+        if head_parent:
+            for b in others:
+                if b in chain:
+                    continue
+                if head_parent == tips[b] or head_parent in olds[b]:
+                    lower.append(b)
+        if not lower:
+            lower = [b for b in others if b not in chain and is_ancestor(b, head)]
         if not lower:
             break
-        # Closest = fewest commits between ancestor and head (immediate parent)
-        lower.sort(key=lambda b: rev_list_count(b, head_name))
+        lower.sort(key=lambda b: rev_list_count(b, head))
         chain.insert(0, lower[0])
 
-    # Walk up: find local branches that have chain[-1] as ancestor
+    # Walk up: find the branch that sits on chain[-1] — i.e. the branch whose
+    # parent commit is chain[-1]'s current or old (reflog) tip. Falls back to
+    # ancestry for multi-commit branches.
     while True:
-        tail_name = chain[-1]
-        higher = [b for b in all_branches if b not in chain and is_ancestor(tail_name, b)]
+        tail = chain[-1]
+        tail_tip = tips[tail]
+        tail_old = olds[tail]
+        higher = []
+        for b in others:
+            if b in chain:
+                continue
+            bp = parents[b]
+            if bp and (bp == tail_tip or bp in tail_old):
+                higher.append(b)
+        if not higher:
+            higher = [b for b in others if b not in chain and is_ancestor(tail, b)]
         if not higher:
             break
-        # Closest = fewest commits above tail
-        higher.sort(key=lambda b: rev_list_count(tail_name, b))
+        higher.sort(key=lambda b: rev_list_count(tail, b))
         chain.append(higher[0])
 
     return chain
@@ -257,48 +307,53 @@ def cmd_rebase(base=DEFAULT_BASE):
 
 
 def cmd_restack():
+    """Restack the whole stack so each branch sits directly on the branch
+    below it. Works no matter which branch is checked out. Detects the
+    lowest branch that no longer sits directly on the branch below it (e.g.
+    because that lower branch was amended) and, from there up, rebases each
+    branch onto the (already-restacked) branch below it. Replaying one
+    branch at a time preserves per-branch amends (each branch's own commits
+    are replayed, not just the top's history) and updates each branch pointer
+    directly — no subject-based remap needed. Run this after amending any
+    branch; if multiple branches were amended before restacking, all amends
+    are preserved."""
     stack = detect_stack()
-    cur = current_branch()
-    idx = stack.index(cur)
-
-    if idx == len(stack) - 1:
-        print(f"{cur} is already the top of the stack — nothing to restack.")
+    if len(stack) == 1:
+        print(f"{stack[0]} is the only branch in the stack — nothing to restack.")
         return
 
-    new_sha = run(f"git rev-parse {cur}", capture=True)
-    old_sha = None
-    for i in range(1, 15):
-        candidate = run(f"git rev-parse {cur}@{{{i}}}", capture=True, check=False)
-        if candidate and candidate != new_sha:
-            old_sha = candidate
+    cur = current_branch()
+
+    # Find the lowest branch that no longer sits directly on the branch below
+    # it. Everything from there up needs to be replayed onto the branch below.
+    stale_i = None
+    for i in range(1, len(stack)):
+        parent_sha = run(f"git rev-parse {stack[i-1]}", capture=True)
+        child_parent = run(f"git rev-parse {stack[i]}^", capture=True)
+        if child_parent != parent_sha:
+            stale_i = i
             break
-    if not old_sha:
-        raise SystemExit(
-            f"could not find a previous position for {cur} in reflog. "
-            "did you amend it?"
-        )
 
-    top = stack[-1]
-    old_subjects = {b: commit_subject(b) for b in stack[idx+1:]}
+    if stale_i is None:
+        print(f"\n{green('✓')} stack is already restacked.")
+        return
 
-    count = len(stack) - idx - 1
-    print(f"\n{bold('Restacking')} {count} branch{'es' if count != 1 else ''} above {cyan(cur)}...")
-    print(f"  {dim('old')} {old_sha[:8]}  {dim('→')}  {dim('new')} {new_sha[:8]}\n")
-    run(f"git rebase --onto {cur} {old_sha} {top}")
+    base_branch = stack[stale_i - 1]
+    count = len(stack) - stale_i
+    print(f"\n{bold('Restacking')} {count} branch{'es' if count != 1 else ''} above {cyan(base_branch)}...\n")
 
-    new_commits = run(f"git rev-list --reverse {cur}..{top}", capture=True).splitlines()
-    new_subjects = {commit_subject(c): c for c in new_commits}
-    for b in stack[idx+1:-1]:
-        subj = old_subjects.get(b)
-        new = new_subjects.get(subj) if subj else None
-        if new:
-            run(f"git branch -f {b} {new}")
-            print(f"  {green('✓')} {bold(b)} {dim('→')} {new[:8]} {dim(subj)}")
-        else:
-            print(f"  {red('✗')} {bold(b)} {dim('— could not remap')} {dim(repr(subj))}")
+    # Cascade: rebase each branch from the stale point up onto the branch below
+    # it (which is already restacked by the previous iteration). Each rebase
+    # replays that branch's own commits and updates its pointer directly.
+    for i in range(stale_i, len(stack)):
+        b = stack[i]
+        old_parent = run(f"git rev-parse {b}^", capture=True)
+        run(f"git rebase --onto {stack[i-1]} {old_parent} {b}")
+        new_sha = run(f"git rev-parse {b}", capture=True)
+        print(f"  {green('✓')} {bold(b)} {dim('→')} {new_sha[:8]}")
 
-    run(f"git checkout {top}")
-    print(f"\n{green('✓')} done. now on {bold(top)}.")
+    run(f"git checkout {cur}")
+    print(f"\n{green('✓')} done. still on {bold(cur)}.")
     print(f"  push with: {dim('git stack push')}")
 
 
