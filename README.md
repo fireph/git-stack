@@ -28,7 +28,7 @@ Requires `git` and `gh` (GitHub CLI). Ensure `~/.local/bin` is on your `PATH`.
 | `git stack rebase [base]` | Rebase the whole stack onto a new base (default `origin/main`) |
 | `git stack restack` | Restack the whole stack (after amending any branch) |
 | `git stack push [-f]` | Push all branches + update each PR's base on GitHub |
-| `git stack annotate` | Insert/update a stack diagram in each PR's description |
+| `git stack annotate [--no-plan]` | Insert/update a stack diagram in each PR's description (+ a collapsible *Full PR Stack Plan* from `plan.md` if present) |
 
 ## How it works
 
@@ -54,6 +54,20 @@ Requires `git` and `gh` (GitHub CLI). Ensure `~/.local/bin` is on your `PATH`.
 
 ---
 <!-- git-stack:end -->
+```
+
+If a `plan.md` file exists at the repo root (gitignored), `annotate` also appends a collapsible block at the **bottom** of each PR description with its contents, again wrapped in HTML comment markers for idempotent replacement. Pass `--no-plan` to skip it (which also removes any existing block):
+
+```markdown
+<!-- git-stack-plan:start -->
+
+<details>
+<summary>Full PR Stack Plan</summary>
+
+contents of plan.md
+
+</details>
+<!-- git-stack-plan:end -->
 ```
 
 ## Typical workflow

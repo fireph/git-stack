@@ -288,6 +288,58 @@ t_detached_head_errors() {
   return 0
 }
 
+# --- annotate: Full PR Stack Plan block (pure functions, no gh needed) ---
+
+# import the git-stack script as a python module and run a snippet
+py_gs() {
+  python3 -c "
+import importlib.util
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader('gs', '$SCRIPT')
+spec = importlib.util.spec_from_loader('gs', loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+$1
+"
+}
+
+t_plan_block_built_correctly() {
+  local out; out=$(py_gs "
+md = m.build_stack_plan_markdown('hello world')
+assert m.STACK_PLAN_BLOCK_START in md, 'missing start marker'
+assert m.STACK_PLAN_BLOCK_END in md, 'missing end marker'
+assert '<details>' in md, 'missing details tag'
+assert '<summary>Full PR Stack Plan</summary>' in md, 'missing summary'
+assert 'hello world' in md, 'missing content'
+print('ok')
+")
+  [ "$out" = "ok" ] || return 1
+  return 0
+}
+
+t_plan_block_idempotent_replace_and_remove() {
+  local out; out=$(py_gs "
+plan = m.build_stack_plan_markdown('version 1')
+# append to a body
+body = m.apply_stack_plan_block('top content', plan)
+assert body.count(m.STACK_PLAN_BLOCK_START) == 1, body
+assert 'version 1' in body
+# replace with a new version (idempotent)
+plan2 = m.build_stack_plan_markdown('version 2')
+body = m.apply_stack_plan_block(body, plan2)
+assert body.count(m.STACK_PLAN_BLOCK_START) == 1, 'duplicate block after re-annotate'
+assert 'version 2' in body, 'new plan missing'
+assert 'version 1' not in body, 'old plan not replaced'
+# remove (simulating --no-plan)
+body = m.apply_stack_plan_block(body, None)
+assert m.STACK_PLAN_BLOCK_START not in body, 'plan not removed by --no-plan'
+assert 'top content' in body, 'top content lost when removing plan'
+print('ok')
+")
+  [ "$out" = "ok" ] || return 1
+  return 0
+}
+
 # --- run all tests ---
 
 run_test "list shows full stack from each branch"              t_list_shows_full_stack_from_each_branch
@@ -308,6 +360,8 @@ run_test "restack returns to the branch you were on"          t_restack_returns_
 run_test "unrelated sibling branch excluded from stack"       t_unrelated_sibling_excluded_from_stack
 run_test "restack with multiple amends preserves all"         t_restack_multiple_amends_preserves_all
 run_test "detached HEAD errors cleanly"                        t_detached_head_errors
+run_test "plan block built with summary + content"             t_plan_block_built_correctly
+run_test "plan block idempotent replace + --no-plan removal"    t_plan_block_idempotent_replace_and_remove
 
 echo
 echo "$PASS passed, $FAIL failed"

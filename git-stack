@@ -7,7 +7,8 @@ Usage:
   git stack rebase [base]       Rebase whole stack onto base (default origin/main)
   git stack restack             Restack whole stack (run after amending any branch)
   git stack push [-f]           Push all branches + update PR bases on GitHub
-  git stack annotate            Update each PR's body with a stack diagram
+  git stack annotate [--no-plan]  Update each PR's body with a stack diagram
+                                (+ Full Orgs Plan from plan.md if present)
 
 Model: each PR is its own named branch, with bases set to the previous branch.
 GitHub's normal Merge button keeps working. Auto-detects the stack from
@@ -357,23 +358,36 @@ def cmd_restack():
     print(f"  push with: {dim('git stack push')}")
 
 
-def cmd_push(force=False):
-    stack = detect_stack()
+def cmd_push(force=False, base=DEFAULT_BASE):
+    stack = detect_stack(base)
     flag = "--force" if force else "--force-with-lease"
     print(f"\n{bold('Pushing')} {len(stack)} branches {dim('(' + flag + ')')}...\n")
     for b in stack:
         run(f"git push {flag} origin {b}")
         print(f"  {green('✓')} {bold(b)}")
 
+    trunk = base.replace("origin/", "")
+    repo_url = run("gh repo view --json url --jq .url", capture=True, check=False)
+    repo_path = repo_url.replace("https://github.com/", "").rstrip("/") if repo_url else ""
+
     print(f"\n{bold('Updating PR bases')}...\n")
+    if not repo_path:
+        print(f"  {red('✗')} {dim('could not determine repo url via `gh repo view`')}")
+        print(f"\n{red('✗')} PR bases not updated.")
+        return
     for i, b in enumerate(stack):
-        pr_base = stack[i-1] if i > 0 else "main"
+        pr_base = stack[i-1] if i > 0 else trunk
         pr_num = get_pr_num(b)
-        if pr_num:
-            run(f"gh pr edit {pr_num} --base {pr_base}", check=False)
+        if not pr_num:
+            print(f"  {yellow('·')} {bold(b)} {dim('— no open PR')}")
+            continue
+        cmd = f"gh api -X PATCH /repos/{repo_path}/pulls/{pr_num} -f base={pr_base}"
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if res.returncode == 0:
             print(f"  {green('✓')} {dim('#' + pr_num)} {bold(b)} {dim('→')} {dim('base ' + pr_base)}")
         else:
-            print(f"  {yellow('·')} {bold(b)} {dim('— no open PR')}")
+            sys.stderr.write(res.stderr)
+            print(f"  {red('✗')} {dim('#' + pr_num)} {bold(b)} {dim('— failed to update base')}")
     print(f"\n{green('✓')} done.")
 
 
@@ -384,6 +398,9 @@ def cmd_status(base=DEFAULT_BASE):
 
 STACK_BLOCK_START = "<!-- git-stack:start -->"
 STACK_BLOCK_END = "<!-- git-stack:end -->"
+
+STACK_PLAN_BLOCK_START = "<!-- git-stack-plan:start -->"
+STACK_PLAN_BLOCK_END = "<!-- git-stack-plan:end -->"
 
 
 def build_stack_markdown(stack, base, repo_url, current_pr_num=None):
@@ -440,9 +457,36 @@ def build_stack_markdown(stack, base, repo_url, current_pr_num=None):
     return "\n".join(lines)
 
 
-def cmd_annotate():
+def build_stack_plan_markdown(plan_content):
+    """Build the collapsible 'Full PR Stack Plan' block for the bottom of
+    the PR description. Wraps the contents of plan.md in a <details> block
+    with HTML comment markers for idempotent replacement."""
+    lines = [STACK_PLAN_BLOCK_START, ""]
+    lines.append("<details>")
+    lines.append("<summary>Full PR Stack Plan</summary>")
+    lines.append("")
+    lines.append(plan_content)
+    lines.append("")
+    lines.append("</details>")
+    lines.append(STACK_PLAN_BLOCK_END)
+    return "\n".join(lines)
+
+
+def apply_stack_plan_block(body, plan_markdown):
+    """Idempotently place the plan block at the bottom of the body. If
+    plan_markdown is falsy, any existing plan block is removed."""
+    if STACK_PLAN_BLOCK_START in body:
+        before = body[:body.index(STACK_PLAN_BLOCK_START)]
+        body = before.rstrip("\n")
+    if plan_markdown:
+        body = body.rstrip("\n") + "\n\n" + plan_markdown
+    return body
+
+
+def cmd_annotate(no_plan=False):
     import tempfile
     import json
+    import os
 
     stack = detect_stack()
     repo_url = run("gh repo view --json url --jq .url", capture=True, check=False)
@@ -451,6 +495,17 @@ def cmd_annotate():
 
     # Extract owner/repo from URL (strip trailing slash)
     repo_path = repo_url.replace("https://github.com/", "").rstrip("/")
+
+    # Read plan.md (at the repo root) unless --no-plan. The file is meant to
+    # be gitignored — it's only appended locally to each PR description.
+    plan_markdown = None
+    if not no_plan:
+        plan_path = "plan.md"
+        if os.path.exists(plan_path):
+            with open(plan_path) as f:
+                plan_content = f.read().strip("\n")
+            if plan_content:
+                plan_markdown = build_stack_plan_markdown(plan_content)
 
     for b in stack:
         pr_num = get_pr_num(b)
@@ -464,16 +519,19 @@ def cmd_annotate():
         body = run(f"gh pr view {pr_num} --json body --jq .body", capture=True, check=False)
 
         if STACK_BLOCK_START in body:
-            # Replace existing block
+            # Replace existing top block
             before = body[:body.index(STACK_BLOCK_START)]
             after = body[body.index(STACK_BLOCK_END) + len(STACK_BLOCK_END):]
-            new_body = before + markdown + after
+            body = before + markdown + after
         else:
             # Prepend block at the top
-            new_body = markdown + "\n\n" + body.lstrip("\n")
+            body = markdown + "\n\n" + body.lstrip("\n")
+
+        # Append/replace the Full PR Stack Plan block at the bottom
+        body = apply_stack_plan_block(body, plan_markdown)
 
         # Use REST API (gh pr edit is broken due to GraphQL deprecation)
-        payload = json.dumps({"body": new_body})
+        payload = json.dumps({"body": body})
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             f.write(payload)
             f.flush()
@@ -500,11 +558,12 @@ def main():
     elif cmd == "restack":
         cmd_restack()
     elif cmd == "push":
-        cmd_push(force=("-f" in args or "--force" in args))
+        base_arg = next((a for a in args if not a.startswith("-")), None)
+        cmd_push(force=("-f" in args or "--force" in args), base=base_arg or DEFAULT_BASE)
     elif cmd == "status":
         cmd_status(args[0] if args else DEFAULT_BASE)
     elif cmd == "annotate":
-        cmd_annotate()
+        cmd_annotate(no_plan=("--no-plan" in args))
     elif cmd in ("-h", "--help", "help"):
         print(__doc__)
     else:
