@@ -34,9 +34,13 @@ Requires `git` and `gh` (GitHub CLI). Ensure `~/.local/bin` is on your `PATH`.
 
 **Stack detection** is automatic — no branch naming conventions, no metadata files. The script walks git ancestry (`git merge-base --is-ancestor`) to find branches that chain together relative to the base branch, and bridges amends via the reflog (an amended branch is no longer an ancestor of the branches above it, but its old position still is). Checkout any branch in the stack — even after amending — and it figures out the rest.
 
-**Rebasing** uses `git rebase --onto` under the hood, then remaps intermediate branches by commit subject so each PR stays on its own commit. After rebasing, intermediate branch pointers are updated to the matching commits in the new history.
+**Rebasing** uses `git rebase --onto` under the hood, replaying each branch's full commit range in order so each PR stays on its own branch.
 
-**Restacking** works from any branch in the stack: it finds the lowest branch that no longer sits directly on the branch below it (e.g. because that lower branch was amended) and replays everything above onto the current lower branch, then remaps the intermediate branches by commit subject. It only fixes inter-stack relationships — if the whole stack has fallen behind `main`, that's a rebase (run `git stack rebase`), which `git stack status` will tell you.
+**Restacking** works from any branch in the stack. Each branch owns the full commit range after the historical tip of the branch below it. Using those reflog-backed boundaries, `restack` finds the lowest stale relationship and replays every branch's commits onto its parent's current tip. This handles commits added to or amended on any branch. It only fixes inter-stack relationships — if the whole stack has fallen behind `main`, that's a rebase (run `git stack rebase`), which `git stack status` will tell you.
+
+Before rewriting branches, `restack` and `rebase` refuse to run with uncommitted changes, another Git operation in progress, an ambiguous stack, or a stack branch checked out in another worktree.
+
+This includes amending a commit in the middle of a branch with interactive rebase: although that rewrite changes every descendant commit in the branch, the old branch tip remains in the local reflog and lets `restack` recover the boundary. As with any reflog-based detection, deleting/expiring the relevant reflog entries before restacking can make that rewritten relationship impossible to infer automatically.
 
 **Pushing** force-pushes (`--force-with-lease` by default, `--force` with `-f`) all branches in the stack and sets each PR's base to the previous branch via the GitHub API.
 
@@ -95,7 +99,7 @@ git stack list
 git stack annotate
 ```
 
-After amending a lower PR (from any branch in the stack):
+After adding or amending commits in any PR branch (from any branch in the stack):
 
 ```bash
 git checkout feature/part-1
@@ -103,6 +107,14 @@ git commit --amend --no-edit
 git stack restack      # restack everything above the amend (run from any branch)
 git stack push         # push everything + update PR bases
 git stack annotate     # refresh the stack diagrams
+```
+
+Branches may contain any number of commits. Adding a commit works the same way:
+
+```bash
+git checkout feature/part-2
+git commit -m "follow-up fixes"
+git stack restack      # replays part 3 onto part 2's new tip
 ```
 
 When `main` moves ahead:
@@ -126,6 +138,5 @@ git stack annotate
 
 ## Limitations
 
-- **One commit per branch.** Each branch should have exactly one commit (its PR). Multi-commit branches work for rebasing but the remap-by-subject logic assumes one commit per PR.
 - **No conflict resolution assistance.** If a rebase hits conflicts, git drops you into the normal interactive rebase — resolve them, `git rebase --continue`, then re-run the original command.
 - **Linear stacks only.** No support for branching stacks (one PR with multiple children). The detection picks one path through the ancestry chain.

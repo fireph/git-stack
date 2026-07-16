@@ -19,6 +19,9 @@ Requires: git, gh (only for `push` and `annotate`).
 
 import subprocess
 import sys
+import json
+import os
+import tempfile
 
 DEFAULT_BASE = "origin/main"
 
@@ -60,57 +63,80 @@ def magenta(text):
     return c("35", text)
 
 
-def run(cmd, check=True, capture=False):
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+def run(args, check=True, capture=False):
+    """Run a command without a shell; args must be a sequence of arguments."""
+    if isinstance(args, str):
+        raise TypeError("run() requires an argument list")
+    result = subprocess.run(args, capture_output=True, text=True)
     if check and result.returncode != 0:
         if capture:
             sys.stderr.write(result.stderr)
-        raise SystemExit(f"command failed ({result.returncode}): {cmd}")
+        raise SystemExit(
+            f"command failed ({result.returncode}): "
+            + " ".join(str(arg) for arg in args)
+        )
     return result.stdout.strip() if capture else ""
 
 
 def current_branch():
-    return run("git rev-parse --abbrev-ref HEAD", capture=True)
-
-
-def commit_subject(sha):
-    return run(f"git log -1 --format=%s {sha}", capture=True)
+    return run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture=True)
 
 
 def rev_list_count(base, head):
-    return int(run(f"git rev-list --count {base}..{head}", capture=True) or "0")
+    return int(run(["git", "rev-list", "--count", f"{base}..{head}"], capture=True) or "0")
 
 
 def is_ancestor(a, b):
     return subprocess.run(
-        f"git merge-base --is-ancestor {a} {b}", shell=True
+        ["git", "merge-base", "--is-ancestor", a, b],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     ).returncode == 0
 
 
 def all_local_branches():
-    out = run("git for-each-ref --format='%(refname:short)' refs/heads/", capture=True)
+    out = run(["git", "for-each-ref", "--format=%(refname:short)", "refs/heads/"], capture=True)
     return [line for line in out.splitlines() if line]
 
 
-def old_positions(branch, tip, limit=15):
-    """Previous SHAs of `branch` from its reflog that represent amends/rebases
-    rather than normal history. A normal commit or branch creation advances
-    the branch from an ancestor to its descendant, so the old position IS an
-    ancestor of the current tip — those are excluded. An amend (or rebase)
-    leaves the old tip as a sibling (not an ancestor) of the new tip, and that
-    is the case we need to bridge: an amended branch is no longer an ancestor
-    of the branches above it, but its old position still is."""
-    seen = []
-    for i in range(1, limit + 1):
-        sha = run(f"git rev-parse {branch}@{{{i}}}", capture=True, check=False)
-        if not sha:
-            break
-        if sha == tip or sha in seen:
+def branch_positions(branch, tip):
+    """Return current and recent historical tips for a branch.
+
+    This includes ancestor positions created by adding commits. Those
+    positions are stack boundaries too: a child may still be
+    based on yesterday's tip after commits are appended to its parent.
+    """
+    positions = [tip]
+    entries = run(
+        ["git", "reflog", "show", "--format=%H%x09%gs", branch],
+        capture=True,
+        check=False,
+    )
+    for entry in entries.splitlines():
+        sha, _, action = entry.partition("\t")
+        # The branch's creation point is its parent's tip, but was never a tip
+        # of this branch containing this PR. Treating it as one reverses edges.
+        if action.startswith("branch: Created from"):
             continue
-        if is_ancestor(sha, tip):
-            continue
-        seen.append(sha)
-    return seen
+        if sha and sha not in positions:
+            positions.append(sha)
+    return positions
+
+
+def branch_boundary(parent, child, positions=None):
+    """Find the historical parent tip on which child was based.
+
+    The nearest reflog position of parent that is an ancestor of child marks
+    the start of child's own commit range.  This works for both rewritten
+    parent tips and parent tips advanced by newly added commits.
+    """
+    if positions is None:
+        tip = run(["git", "rev-parse", parent], capture=True)
+        positions = branch_positions(parent, tip)
+    candidates = [sha for sha in positions if is_ancestor(sha, child)]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda sha: rev_list_count(sha, child))
 
 
 def detect_stack(base=DEFAULT_BASE):
@@ -128,77 +154,62 @@ def detect_stack(base=DEFAULT_BASE):
     trunk = {base, base.replace("origin/", ""), "main", "master"}
     branches = [b for b in all_local_branches() if b not in trunk]
     relevant = branches if cur in branches else branches + [cur]
-    tips = {b: run(f"git rev-parse {b}", capture=True) for b in relevant}
-    parents = {b: run(f"git rev-parse {b}^", capture=True, check=False) for b in relevant}
-    olds = {b: old_positions(b, tips[b]) for b in relevant}
+    tips = {b: run(["git", "rev-parse", b], capture=True) for b in relevant}
+    positions = {b: branch_positions(b, tips[b]) for b in relevant}
     others = [b for b in branches if b != cur]
 
     chain = [cur]
 
-    # Walk down: find the branch chain[0] sits on — i.e. the branch whose
-    # current or old (reflog) tip is chain[0]'s parent commit. Falls back to
-    # ancestry for multi-commit branches.
+    # Walk down by finding the nearest current/historical branch tip below the
+    # head. Historical tips preserve adjacency after adds, amends, and rebases.
     while True:
         head = chain[0]
-        head_parent = parents[head]
-        lower = []
-        if head_parent:
-            for b in others:
-                if b in chain:
-                    continue
-                if head_parent == tips[b] or head_parent in olds[b]:
-                    lower.append(b)
-        if not lower:
-            lower = [b for b in others if b not in chain and is_ancestor(b, head)]
+        boundaries = {
+            b: branch_boundary(b, head, positions[b])
+            for b in others if b not in chain
+        }
+        lower = [b for b, boundary in boundaries.items() if boundary]
         if not lower:
             break
-        lower.sort(key=lambda b: rev_list_count(b, head))
-        chain.insert(0, lower[0])
+        scores = {b: rev_list_count(boundaries[b], head) for b in lower}
+        best = min(scores.values())
+        nearest = [b for b in lower if scores[b] == best]
+        if len(nearest) > 1:
+            raise SystemExit("ambiguous stack below " + head + ": " + ", ".join(sorted(nearest)))
+        chain.insert(0, nearest[0])
 
-    # Walk up: find the branch that sits on chain[-1] — i.e. the branch whose
-    # parent commit is chain[-1]'s current or old (reflog) tip. Falls back to
-    # ancestry for multi-commit branches.
+    # Walk up using the same historical-boundary relationship.
     while True:
         tail = chain[-1]
-        tail_tip = tips[tail]
-        tail_old = olds[tail]
-        higher = []
-        for b in others:
-            if b in chain:
-                continue
-            bp = parents[b]
-            if bp and (bp == tail_tip or bp in tail_old):
-                higher.append(b)
-        if not higher:
-            higher = [b for b in others if b not in chain and is_ancestor(tail, b)]
+        boundaries = {
+            b: branch_boundary(tail, b, positions[tail])
+            for b in others if b not in chain
+        }
+        higher = [b for b, boundary in boundaries.items() if boundary]
         if not higher:
             break
-        higher.sort(key=lambda b: rev_list_count(tail, b))
-        chain.append(higher[0])
+        scores = {b: rev_list_count(boundaries[b], b) for b in higher}
+        best = min(scores.values())
+        nearest = [b for b in higher if scores[b] == best]
+        # Equal distances can occur after a multi-commit rewrite. If one tied
+        # candidate has another tied candidate historically below it, it is a
+        # descendant rather than a sibling and is not the direct next branch.
+        nearest = [
+            b for b in nearest
+            if not any(
+                other != b and branch_boundary(other, b, positions[other])
+                for other in nearest
+            )
+        ]
+        if len(nearest) > 1:
+            raise SystemExit("ambiguous stack above " + tail + ": " + ", ".join(sorted(nearest)))
+        chain.append(nearest[0])
 
     return chain
 
 
-def remap_branches(stack, base, top, old_subjects, skip_bottom=0):
-    """After rebasing `top` onto `base`, update each branch in stack[skip_bottom:-1]
-    to the new commit with matching subject."""
-    new_commits = run(f"git rev-list --reverse {base}..{top}", capture=True).splitlines()
-    new_subjects = {}
-    for c in new_commits:
-        new_subjects[commit_subject(c)] = c
-
-    for b in stack[skip_bottom:-1]:
-        subj = old_subjects.get(b)
-        new_sha = new_subjects.get(subj) if subj else None
-        if new_sha:
-            run(f"git branch -f {b} {new_sha}")
-            print(f"  updated {b} -> {new_sha[:8]} ({subj})")
-        else:
-            print(f"  WARNING: could not remap {b} (subject: {subj!r})")
-
-
 def get_pr_num(branch):
-    return run(f"gh pr list --head {branch} --json number --jq .[0].number",
+    return run(["gh", "pr", "list", "--head", branch, "--json", "number", "--jq", ".[0].number"],
                capture=True, check=False)
 
 
@@ -238,8 +249,8 @@ def render_stack(stack, base=DEFAULT_BASE, show_status=False):
         # Status
         status_str = ""
         if show_status:
-            parent_sha = run(f"git rev-parse {parent}", capture=True)
-            mb = run(f"git merge-base {b} {parent}", capture=True)
+            parent_sha = run(["git", "rev-parse", parent], capture=True)
+            mb = run(["git", "merge-base", b, parent], capture=True)
             if mb == parent_sha:
                 status_str = green("ok")
             else:
@@ -252,7 +263,7 @@ def render_stack(stack, base=DEFAULT_BASE, show_status=False):
 
         # PR title (only on list, not status — keeps status cleaner)
         if not show_status:
-            pr_title = run(f"gh pr view {pr_num} --json title --jq .title",
+            pr_title = run(["gh", "pr", "view", pr_num, "--json", "title", "--jq", ".title"],
                            capture=True, check=False) if pr_num else ""
             subj_str = dim(pr_title) if pr_title else ""
         else:
@@ -284,24 +295,68 @@ def cmd_list(base=DEFAULT_BASE):
     render_stack(stack, base, show_status=False)
 
 
+def mutation_preflight(stack=None):
+    """Refuse to start a multi-branch rewrite from an unsafe repository state."""
+    git_dir = run(["git", "rev-parse", "--git-dir"], capture=True)
+    for marker, operation in (
+        ("rebase-merge", "rebase"),
+        ("rebase-apply", "rebase"),
+        ("MERGE_HEAD", "merge"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("REVERT_HEAD", "revert"),
+    ):
+        path = marker if os.path.isabs(marker) else os.path.join(git_dir, marker)
+        if os.path.exists(path):
+            raise SystemExit(f"cannot continue: a {operation} is already in progress")
+    if run(["git", "status", "--porcelain"], capture=True):
+        raise SystemExit("cannot continue: working tree has uncommitted changes")
+
+    if stack is None:
+        return
+
+    current_root = os.path.realpath(
+        run(["git", "rev-parse", "--show-toplevel"], capture=True)
+    )
+    worktree_path = None
+    for line in run(["git", "worktree", "list", "--porcelain"], capture=True).splitlines():
+        if line.startswith("worktree "):
+            worktree_path = os.path.realpath(line.removeprefix("worktree "))
+        elif line.startswith("branch refs/heads/") and worktree_path != current_root:
+            branch = line.removeprefix("branch refs/heads/")
+            if branch in stack:
+                raise SystemExit(
+                    f"cannot continue: stack branch {branch} is checked out in "
+                    f"another worktree ({worktree_path})"
+                )
+
+
 def cmd_rebase(base=DEFAULT_BASE):
+    mutation_preflight()
     stack = detect_stack(base)
+    mutation_preflight(stack)
     if len(stack) == 1:
-        print(f"only one branch in stack; just `git rebase {base}`")
+        branch = stack[0]
+        old_base_sha = run(["git", "merge-base", base, branch], capture=True)
+        run(["git", "rebase", "--onto", base, old_base_sha, branch])
+        print(f"\n{green('✓')} rebased {bold(branch)} onto {cyan(base)}.")
         return
 
     bottom = stack[0]
     top = stack[-1]
-    old_subjects = {b: commit_subject(b) for b in stack}
-
-    old_base_sha = run(f"git rev-parse {bottom}~1", capture=True)
+    boundaries = [branch_boundary(stack[i-1], stack[i])
+                  for i in range(1, len(stack))]
+    if any(boundary is None for boundary in boundaries):
+        raise SystemExit("could not determine all branch boundaries")
+    old_base_sha = run(["git", "merge-base", base, bottom], capture=True)
 
     print(f"\n{bold('Rebasing')} {len(stack)} branches onto {cyan(base)}...\n")
-    run(f"git rebase --onto {base} {old_base_sha} {top}")
+    run(["git", "rebase", "--onto", base, old_base_sha, bottom])
+    print(f"  {green('✓')} {bold(bottom)}")
+    for i in range(1, len(stack)):
+        run(["git", "rebase", "--onto", stack[i-1], boundaries[i-1], stack[i]])
+        print(f"  {green('✓')} {bold(stack[i])}")
 
-    remap_branches(stack, base, top, old_subjects)
-
-    run(f"git checkout {top}")
+    run(["git", "checkout", top])
     print(f"\n{green('✓')} done. now on {bold(top)}.")
     print(f"  review with: {dim('git stack status')}")
     print(f"  push with:   {dim('git stack push')}")
@@ -318,20 +373,32 @@ def cmd_restack():
     directly — no subject-based remap needed. Run this after amending any
     branch; if multiple branches were amended before restacking, all amends
     are preserved."""
+    mutation_preflight()
     stack = detect_stack()
+    mutation_preflight(stack)
     if len(stack) == 1:
         print(f"{stack[0]} is the only branch in the stack — nothing to restack.")
         return
 
     cur = current_branch()
 
-    # Find the lowest branch that no longer sits directly on the branch below
-    # it. Everything from there up needs to be replayed onto the branch below.
+    # Capture every child's old boundary before moving anything. Each branch
+    # owns the complete range after that boundary, not merely its tip commit.
+    boundaries = []
+    for i in range(1, len(stack)):
+        boundary = branch_boundary(stack[i-1], stack[i])
+        if not boundary:
+            raise SystemExit(
+                f"could not find the historical boundary between "
+                f"{stack[i-1]} and {stack[i]}"
+            )
+        boundaries.append(boundary)
+
+    # Find the lowest child whose recorded base is not its parent's current tip.
     stale_i = None
     for i in range(1, len(stack)):
-        parent_sha = run(f"git rev-parse {stack[i-1]}", capture=True)
-        child_parent = run(f"git rev-parse {stack[i]}^", capture=True)
-        if child_parent != parent_sha:
+        parent_sha = run(["git", "rev-parse", stack[i-1]], capture=True)
+        if boundaries[i-1] != parent_sha:
             stale_i = i
             break
 
@@ -348,12 +415,12 @@ def cmd_restack():
     # replays that branch's own commits and updates its pointer directly.
     for i in range(stale_i, len(stack)):
         b = stack[i]
-        old_parent = run(f"git rev-parse {b}^", capture=True)
-        run(f"git rebase --onto {stack[i-1]} {old_parent} {b}")
-        new_sha = run(f"git rev-parse {b}", capture=True)
+        old_parent = boundaries[i-1]
+        run(["git", "rebase", "--onto", stack[i-1], old_parent, b])
+        new_sha = run(["git", "rev-parse", b], capture=True)
         print(f"  {green('✓')} {bold(b)} {dim('→')} {new_sha[:8]}")
 
-    run(f"git checkout {cur}")
+    run(["git", "checkout", cur])
     print(f"\n{green('✓')} done. still on {bold(cur)}.")
     print(f"  push with: {dim('git stack push')}")
 
@@ -363,11 +430,11 @@ def cmd_push(force=False, base=DEFAULT_BASE):
     flag = "--force" if force else "--force-with-lease"
     print(f"\n{bold('Pushing')} {len(stack)} branches {dim('(' + flag + ')')}...\n")
     for b in stack:
-        run(f"git push {flag} origin {b}")
+        run(["git", "push", flag, "origin", b])
         print(f"  {green('✓')} {bold(b)}")
 
     trunk = base.replace("origin/", "")
-    repo_url = run("gh repo view --json url --jq .url", capture=True, check=False)
+    repo_url = run(["gh", "repo", "view", "--json", "url", "--jq", ".url"], capture=True, check=False)
     repo_path = repo_url.replace("https://github.com/", "").rstrip("/") if repo_url else ""
 
     print(f"\n{bold('Updating PR bases')}...\n")
@@ -375,19 +442,26 @@ def cmd_push(force=False, base=DEFAULT_BASE):
         print(f"  {red('✗')} {dim('could not determine repo url via `gh repo view`')}")
         print(f"\n{red('✗')} PR bases not updated.")
         return
+    failures = 0
     for i, b in enumerate(stack):
         pr_base = stack[i-1] if i > 0 else trunk
         pr_num = get_pr_num(b)
         if not pr_num:
             print(f"  {yellow('·')} {bold(b)} {dim('— no open PR')}")
             continue
-        cmd = f"gh api -X PATCH /repos/{repo_path}/pulls/{pr_num} -f base={pr_base}"
-        res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        res = subprocess.run(
+            ["gh", "api", "-X", "PATCH", f"/repos/{repo_path}/pulls/{pr_num}", "-f", f"base={pr_base}"],
+            capture_output=True,
+            text=True,
+        )
         if res.returncode == 0:
             print(f"  {green('✓')} {dim('#' + pr_num)} {bold(b)} {dim('→')} {dim('base ' + pr_base)}")
         else:
+            failures += 1
             sys.stderr.write(res.stderr)
             print(f"  {red('✗')} {dim('#' + pr_num)} {bold(b)} {dim('— failed to update base')}")
+    if failures:
+        raise SystemExit(f"failed to update {failures} PR base{'s' if failures != 1 else ''}")
     print(f"\n{green('✓')} done.")
 
 
@@ -426,7 +500,7 @@ def build_stack_markdown(stack, base, repo_url, current_pr_num=None):
         # Tree shape by position; arrow marks current PR without changing shape
         base = "└──" if is_last else "├──"
         connector = base[:-1] + "➤" if is_current else base
-        title = run(f"gh pr view {pr_num} --json title --jq .title",
+        title = run(["gh", "pr", "view", pr_num, "--json", "title", "--jq", ".title"],
                     capture=True, check=False) if pr_num else b
         title_str = f"`{title}`" if title else ""
         if pr_num:
@@ -484,12 +558,8 @@ def apply_stack_plan_block(body, plan_markdown):
 
 
 def cmd_annotate(no_plan=False):
-    import tempfile
-    import json
-    import os
-
     stack = detect_stack()
-    repo_url = run("gh repo view --json url --jq .url", capture=True, check=False)
+    repo_url = run(["gh", "repo", "view", "--json", "url", "--jq", ".url"], capture=True, check=False)
     if not repo_url:
         raise SystemExit("could not determine repo url via `gh repo view`")
 
@@ -507,6 +577,8 @@ def cmd_annotate(no_plan=False):
             if plan_content:
                 plan_markdown = build_stack_plan_markdown(plan_content)
 
+    updated = 0
+    failures = 0
     for b in stack:
         pr_num = get_pr_num(b)
         if not pr_num:
@@ -516,9 +588,13 @@ def cmd_annotate(no_plan=False):
         # Build the stack block with this PR marked as current
         markdown = build_stack_markdown(stack, DEFAULT_BASE, repo_url, current_pr_num=pr_num)
 
-        body = run(f"gh pr view {pr_num} --json body --jq .body", capture=True, check=False)
+        body = run(["gh", "pr", "view", pr_num, "--json", "body", "--jq", ".body"], capture=True, check=False)
 
         if STACK_BLOCK_START in body:
+            if STACK_BLOCK_END not in body:
+                print(f"  {red('✗')} {dim('#' + pr_num)} {bold(b)} {dim('— malformed stack markers')}")
+                failures += 1
+                continue
             # Replace existing top block
             before = body[:body.index(STACK_BLOCK_START)]
             after = body[body.index(STACK_BLOCK_END) + len(STACK_BLOCK_END):]
@@ -532,15 +608,34 @@ def cmd_annotate(no_plan=False):
 
         # Use REST API (gh pr edit is broken due to GraphQL deprecation)
         payload = json.dumps({"body": body})
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            f.write(payload)
-            f.flush()
-            run(f"gh api -X PATCH /repos/{repo_path}/pulls/{pr_num} --input {f.name}",
-                check=False)
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+                temp_path = f.name
+                f.write(payload)
+            result = subprocess.run(
+                ["gh", "api", "-X", "PATCH", f"/repos/{repo_path}/pulls/{pr_num}", "--input", temp_path],
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
 
+        if result.returncode != 0:
+            sys.stderr.write(result.stderr)
+            print(f"  {red('✗')} {dim('#' + pr_num)} {bold(b)} {dim('— failed to update description')}")
+            failures += 1
+            continue
+        updated += 1
         print(f"  {green('✓')} {dim('#' + pr_num)} {bold(b)}")
 
-    print(f"\n{green('✓')} updated {len(stack)} PR descriptions.")
+    if failures:
+        raise SystemExit(f"updated {updated} PR descriptions; {failures} failed")
+    print(f"\n{green('✓')} updated {updated} PR descriptions.")
 
 
 def main():
