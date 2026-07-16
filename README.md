@@ -27,6 +27,7 @@ Requires `git` and `gh` (GitHub CLI). Ensure `~/.local/bin` is on your `PATH`.
 | `git stack status` | Same as `list` + shows which branches need restacking |
 | `git stack rebase [base]` | Rebase the whole stack onto a new base (default `origin/main`) |
 | `git stack restack` | Restack the whole stack (after amending any branch) |
+| `git stack sync [base]` | Fetch trunk, remove a merged PR prefix, and restack the remaining branches |
 | `git stack push [-f]` | Push all branches + update each PR's base on GitHub |
 | `git stack annotate [--no-plan]` | Insert/update a stack diagram in each PR's description (+ a collapsible *Full PR Stack Plan* from `plan.md` if present) |
 
@@ -37,6 +38,8 @@ Requires `git` and `gh` (GitHub CLI). Ensure `~/.local/bin` is on your `PATH`.
 **Rebasing** uses `git rebase --onto` under the hood, replaying each branch's full commit range in order so each PR stays on its own branch.
 
 **Restacking** works from any branch in the stack. Each branch owns the full commit range after the historical tip of the branch below it. Using those reflog-backed boundaries, `restack` finds the lowest stale relationship and replays every branch's commits onto its parent's current tip. This handles commits added to or amended on any branch. It only fixes inter-stack relationships — if the whole stack has fallen behind `main`, that's a rebase (run `git stack rebase`), which `git stack status` will tell you.
+
+**Syncing** fetches the remote trunk and queries GitHub for merged PRs. A contiguous merged prefix is removed from the active stack, then each surviving branch's own commits are replayed onto the updated trunk. This works with merge, squash, and rebase merges. Merged local branches are retained; if the checked-out branch was merged, `sync` checks out the new bottom branch. If the entire stack is merged, it checks out and fast-forwards the local trunk branch.
 
 Before rewriting branches, `restack` and `rebase` refuse to run with uncommitted changes, another Git operation in progress, an ambiguous stack, or a stack branch checked out in another worktree.
 
@@ -123,6 +126,13 @@ When `main` moves ahead:
 git stack rebase origin/main
 git stack push
 git stack annotate
+```
+
+After one or more PRs at the bottom of the stack merge:
+
+```bash
+git stack sync          # fetch main, trim merged PRs, restack survivors
+git stack push          # push rewritten branches and update PR bases
 ```
 
 ## Why not Graphite / ghstack / sapling?

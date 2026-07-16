@@ -6,6 +6,7 @@ Usage:
   git stack status              Show stack + which branches need restacking
   git stack rebase [base]       Rebase whole stack onto base (default origin/main)
   git stack restack             Restack whole stack (run after amending any branch)
+  git stack sync [base]         Fetch, remove merged PRs, and restack survivors
   git stack push [-f]           Push all branches + update PR bases on GitHub
   git stack annotate [--no-plan]  Update each PR's body with a stack diagram
                                 (+ Full Orgs Plan from plan.md if present)
@@ -14,7 +15,7 @@ Model: each PR is its own named branch, with bases set to the previous branch.
 GitHub's normal Merge button keeps working. Auto-detects the stack from
 branch ancestry relative to the base branch (default: origin/main).
 
-Requires: git, gh (only for `push` and `annotate`).
+Requires: git, gh (only for `sync`, `push`, and `annotate`).
 """
 
 import subprocess
@@ -152,7 +153,10 @@ def detect_stack(base=DEFAULT_BASE):
         raise SystemExit("detached HEAD — checkout a branch first")
 
     trunk = {base, base.replace("origin/", ""), "main", "master"}
-    branches = [b for b in all_local_branches() if b not in trunk]
+    branches = [
+        b for b in all_local_branches()
+        if b not in trunk and not is_ancestor(b, base)
+    ]
     relevant = branches if cur in branches else branches + [cur]
     tips = {b: run(["git", "rev-parse", b], capture=True) for b in relevant}
     positions = {b: branch_positions(b, tips[b]) for b in relevant}
@@ -211,6 +215,27 @@ def detect_stack(base=DEFAULT_BASE):
 def get_pr_num(branch):
     return run(["gh", "pr", "list", "--head", branch, "--json", "number", "--jq", ".[0].number"],
                capture=True, check=False)
+
+
+def get_pr_state(branch):
+    """Return OPEN, CLOSED, MERGED, or NONE for the newest PR on branch."""
+    result = subprocess.run(
+        ["gh", "pr", "list", "--head", branch, "--state", "all", "--limit", "1",
+         "--json", "state,mergedAt"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr)
+        raise SystemExit(f"could not determine PR state for {branch}")
+    try:
+        prs = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        raise SystemExit(f"invalid PR state response for {branch}")
+    if not prs:
+        return "NONE"
+    pr = prs[0]
+    return "MERGED" if pr.get("mergedAt") else pr.get("state", "NONE").upper()
 
 
 def render_stack(stack, base=DEFAULT_BASE, show_status=False):
@@ -360,6 +385,77 @@ def cmd_rebase(base=DEFAULT_BASE):
     print(f"\n{green('✓')} done. now on {bold(top)}.")
     print(f"  review with: {dim('git stack status')}")
     print(f"  push with:   {dim('git stack push')}")
+
+
+def cmd_sync(base=DEFAULT_BASE):
+    """Fetch trunk, trim a contiguous merged PR prefix, and rebase survivors."""
+    mutation_preflight()
+    stack = detect_stack(base)
+    mutation_preflight(stack)
+    cur = current_branch()
+
+    if "/" not in base:
+        raise SystemExit("sync base must be a remote-tracking branch (for example origin/main)")
+    remote, trunk = base.split("/", 1)
+
+    # Capture boundaries before fetching or moving refs.
+    boundaries = [
+        branch_boundary(stack[i-1], stack[i]) for i in range(1, len(stack))
+    ]
+    if any(boundary is None for boundary in boundaries):
+        raise SystemExit("could not determine all branch boundaries")
+
+    print(f"\n{bold('Syncing')} stack with {cyan(base)}...\n")
+    run(["git", "fetch", remote])
+
+    states = [get_pr_state(branch) for branch in stack]
+    merged_count = 0
+    while merged_count < len(stack) and states[merged_count] == "MERGED":
+        merged_count += 1
+    later_merged = [
+        stack[i] for i in range(merged_count, len(stack)) if states[i] == "MERGED"
+    ]
+    if later_merged:
+        raise SystemExit(
+            "non-contiguous merged PRs in stack: " + ", ".join(later_merged)
+        )
+
+    merged = stack[:merged_count]
+    survivors = stack[merged_count:]
+    for branch in merged:
+        print(f"  {green('✓')} {bold(branch)} {dim('merged')}")
+
+    if not survivors:
+        local_trunk = f"refs/heads/{trunk}"
+        exists = subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", local_trunk]
+        ).returncode == 0
+        if not exists:
+            raise SystemExit(f"all PRs are merged, but local branch {trunk} does not exist")
+        run(["git", "checkout", trunk])
+        run(["git", "merge", "--ff-only", base])
+        print(f"\n{green('✓')} entire stack is merged. now on {bold(trunk)}.")
+        return
+
+    first = merged_count
+    if merged_count:
+        old_base = boundaries[first - 1]
+    else:
+        old_base = run(["git", "merge-base", base, survivors[0]], capture=True)
+
+    run(["git", "rebase", "--onto", base, old_base, survivors[0]])
+    print(f"  {green('✓')} {bold(survivors[0])} {dim('→')} {base}")
+    for i in range(first + 1, len(stack)):
+        run(["git", "rebase", "--onto", stack[i-1], boundaries[i-1], stack[i]])
+        print(f"  {green('✓')} {bold(stack[i])} {dim('→')} {stack[i-1]}")
+
+    target = survivors[0] if cur in merged else cur
+    run(["git", "checkout", target])
+    print(f"\n{green('✓')} synced {len(survivors)} active branch{'es' if len(survivors) != 1 else ''}.")
+    if merged:
+        print(f"  kept merged local branch{'es' if len(merged) != 1 else ''}: {', '.join(merged)}")
+    print(f"  now on:     {bold(target)}")
+    print(f"  push with:  {dim('git stack push')}")
 
 
 def cmd_restack():
@@ -652,6 +748,8 @@ def main():
         cmd_rebase(args[0] if args else DEFAULT_BASE)
     elif cmd == "restack":
         cmd_restack()
+    elif cmd == "sync":
+        cmd_sync(args[0] if args else DEFAULT_BASE)
     elif cmd == "push":
         base_arg = next((a for a in args if not a.startswith("-")), None)
         cmd_push(force=("-f" in args or "--force" in args), base=base_arg or DEFAULT_BASE)

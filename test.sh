@@ -658,6 +658,131 @@ make_fake_gh() {
   chmod +x "$d/gh"
 }
 
+add_test_origin() {
+  local d="$1" remote="$TMP/remote.git"
+  rm -rf "$remote"
+  git clone -q --bare "$d" "$remote"
+  git -C "$d" remote add origin "$remote"
+  git -C "$d" fetch -q origin
+}
+
+advance_remote_main() {
+  local clone="$TMP/upstream"
+  rm -rf "$clone"
+  git clone -q "$TMP/remote.git" "$clone"
+  git -C "$clone" config user.email t@t.t
+  git -C "$clone" config user.name t
+  git -C "$clone" checkout -q main
+  git -C "$clone" commit -q --allow-empty -m "merged stack work"
+  git -C "$clone" push -q origin main
+}
+
+merge_p1_into_remote_main() {
+  local clone="$TMP/upstream"
+  rm -rf "$clone"
+  git clone -q "$TMP/remote.git" "$clone"
+  git -C "$clone" config user.email t@t.t
+  git -C "$clone" config user.name t
+  git -C "$clone" checkout -q main
+  git -C "$clone" merge -q --no-ff origin/p1 -m "merge p1"
+  git -C "$clone" push -q origin main
+}
+
+make_sync_gh() {
+  local d="$1"
+  mkdir -p "$d"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    '[ "${FAKE_GH_FAIL:-0}" = 1 ] && { echo gh failed >&2; exit 1; }' \
+    'head_branch=' \
+    'while [ "$#" -gt 0 ]; do' \
+    '  if [ "$1" = --head ]; then shift; head_branch=$1; fi' \
+    '  shift' \
+    'done' \
+    'case ",${FAKE_MERGED:-}," in' \
+    '  *",$head_branch,"*) echo "[{\"state\":\"MERGED\",\"mergedAt\":\"2026-01-01T00:00:00Z\"}]" ;;' \
+    '  *) echo "[{\"state\":\"OPEN\",\"mergedAt\":null}]" ;;' \
+    'esac' > "$d/gh"
+  chmod +x "$d/gh"
+}
+
+t_sync_bottom_squash_merge_restacks_survivors() {
+  mkrepo r; local d="$TMP/r" fake="$TMP/sync-gh"
+  add_test_origin "$d"; advance_remote_main; make_sync_gh "$fake"
+  local p1_before
+  p1_before=$(git -C "$d" rev-parse p1)
+  git -C "$d" checkout -q p1
+  PATH="$fake:$PATH" FAKE_MERGED=p1 gs "$d" sync >/dev/null 2>&1 || return 1
+  [ "$(git -C "$d" rev-parse --abbrev-ref HEAD)" = p2 ] || return 1
+  [ "$p1_before" = "$(git -C "$d" rev-parse p1)" ] || return 1
+  range_count "$d" origin/main p2 1 || return 1
+  range_count "$d" p2 p3 1 || return 1
+}
+
+t_sync_multiple_merged_prefix_branches() {
+  mkrepo r; local d="$TMP/r" fake="$TMP/sync-gh"
+  add_test_origin "$d"; advance_remote_main; make_sync_gh "$fake"
+  git -C "$d" checkout -q p2
+  PATH="$fake:$PATH" FAKE_MERGED=p1,p2 gs "$d" sync >/dev/null 2>&1 || return 1
+  [ "$(git -C "$d" rev-parse --abbrev-ref HEAD)" = p3 ] || return 1
+  range_count "$d" origin/main p3 1 || return 1
+  git -C "$d" show-ref --verify --quiet refs/heads/p1 || return 1
+  git -C "$d" show-ref --verify --quiet refs/heads/p2 || return 1
+}
+
+t_sync_normal_merge_does_not_rediscover_merged_branch() {
+  mkrepo r; local d="$TMP/r" fake="$TMP/sync-gh"
+  add_test_origin "$d"; merge_p1_into_remote_main; make_sync_gh "$fake"
+  git -C "$d" checkout -q p1
+  PATH="$fake:$PATH" FAKE_MERGED=p1 gs "$d" sync >/dev/null 2>&1 || return 1
+  local out; out=$(PATH="$fake:$PATH" gs "$d" list 2>/dev/null)
+  echo "$out" | grep -q "p2 ←" || return 1
+  echo "$out" | grep -q "p3 ← p2" || return 1
+  if echo "$out" | grep -q "p1 ←"; then return 1; fi
+}
+
+t_sync_without_merges_rebases_and_preserves_checkout() {
+  mkrepo r; local d="$TMP/r" fake="$TMP/sync-gh"
+  add_test_origin "$d"; advance_remote_main; make_sync_gh "$fake"
+  git -C "$d" checkout -q p2
+  PATH="$fake:$PATH" gs "$d" sync >/dev/null 2>&1 || return 1
+  [ "$(git -C "$d" rev-parse --abbrev-ref HEAD)" = p2 ] || return 1
+  range_count "$d" origin/main p1 1 || return 1
+  range_count "$d" p1 p2 1 || return 1
+  range_count "$d" p2 p3 1 || return 1
+}
+
+t_sync_all_merged_checks_out_updated_trunk() {
+  mkrepo r; local d="$TMP/r" fake="$TMP/sync-gh"
+  add_test_origin "$d"; advance_remote_main; make_sync_gh "$fake"
+  local p1_before; p1_before=$(git -C "$d" rev-parse p1)
+  git -C "$d" checkout -q p3
+  PATH="$fake:$PATH" FAKE_MERGED=p1,p2,p3 gs "$d" sync >/dev/null 2>&1 || return 1
+  [ "$(git -C "$d" rev-parse --abbrev-ref HEAD)" = main ] || return 1
+  [ "$(git -C "$d" rev-parse main)" = "$(git -C "$d" rev-parse origin/main)" ] || return 1
+  [ "$p1_before" = "$(git -C "$d" rev-parse p1)" ] || return 1
+}
+
+t_sync_rejects_noncontiguous_merged_prs() {
+  mkrepo r; local d="$TMP/r" fake="$TMP/sync-gh"
+  add_test_origin "$d"; advance_remote_main; make_sync_gh "$fake"
+  local p1_before p2_before out
+  p1_before=$(git -C "$d" rev-parse p1); p2_before=$(git -C "$d" rev-parse p2)
+  if out=$(PATH="$fake:$PATH" FAKE_MERGED=p2 gs "$d" sync 2>&1); then return 1; fi
+  echo "$out" | grep -q "non-contiguous merged PRs" || return 1
+  [ "$p1_before" = "$(git -C "$d" rev-parse p1)" ] || return 1
+  [ "$p2_before" = "$(git -C "$d" rev-parse p2)" ] || return 1
+}
+
+t_sync_pr_lookup_failure_is_nonzero_without_rewrite() {
+  mkrepo r; local d="$TMP/r" fake="$TMP/sync-gh"
+  add_test_origin "$d"; advance_remote_main; make_sync_gh "$fake"
+  local p1_before out; p1_before=$(git -C "$d" rev-parse p1)
+  if out=$(PATH="$fake:$PATH" FAKE_GH_FAIL=1 gs "$d" sync 2>&1); then return 1; fi
+  echo "$out" | grep -q "could not determine PR state" || return 1
+  [ "$p1_before" = "$(git -C "$d" rev-parse p1)" ] || return 1
+}
+
 t_annotate_api_failure_is_nonzero_and_temp_is_cleaned() {
   mkrepo r; local d="$TMP/r" fake="$TMP/fake" temps="$TMP/temps"
   git -C "$d" checkout -q p1; git -C "$d" branch -qD p2 p3
@@ -782,6 +907,13 @@ run_test "restack rejects stack branch in other worktree"     t_restack_rejects_
 run_test "restack conflict leaves recoverable git state"      t_restack_conflict_leaves_git_recovery_state
 run_test "annotate API failure cleans temp and exits nonzero"  t_annotate_api_failure_is_nonzero_and_temp_is_cleaned
 run_test "annotate rejects malformed markers"                 t_annotate_rejects_malformed_markers_without_api_call
+run_test "sync trims squash-merged bottom PR"                 t_sync_bottom_squash_merge_restacks_survivors
+run_test "sync trims multiple merged prefix PRs"              t_sync_multiple_merged_prefix_branches
+run_test "sync forgets normally merged bottom PR"             t_sync_normal_merge_does_not_rediscover_merged_branch
+run_test "sync rebases stack when no PR is merged"            t_sync_without_merges_rebases_and_preserves_checkout
+run_test "sync handles an entirely merged stack"              t_sync_all_merged_checks_out_updated_trunk
+run_test "sync rejects non-contiguous merged PRs"              t_sync_rejects_noncontiguous_merged_prs
+run_test "sync PR lookup failure does not rewrite"            t_sync_pr_lookup_failure_is_nonzero_without_rewrite
 run_test "detached HEAD errors cleanly"                        t_detached_head_errors
 run_test "plan block built with summary + content"             t_plan_block_built_correctly
 run_test "plan block idempotent replace + --no-plan removal"    t_plan_block_idempotent_replace_and_remove
